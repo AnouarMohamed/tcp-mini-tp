@@ -2,17 +2,20 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"tcp-mini-tp/internal/protocol"
 )
 
-func startServer(listenAddr string) error {
+func startServer(listenAddr, token string) error {
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return err
@@ -27,13 +30,26 @@ func startServer(listenAddr string) error {
 			log.Printf("accept error: %v", err)
 			continue
 		}
-		go handleSession(conn)
+		go handleSession(conn, token)
 	}
 }
 
-func handleSession(conn net.Conn) {
+func handleSession(conn net.Conn, token string) {
 	defer conn.Close()
 	log.Printf("new connection from %s", conn.RemoteAddr())
+
+	if err := authenticateClient(conn, token); err != nil {
+		log.Printf("authentication failed for %s: %v", conn.RemoteAddr(), err)
+		_ = protocol.WriteFrame(conn, "auth_fail")
+		return
+	}
+
+	if err := protocol.WriteFrame(conn, "auth_ok"); err != nil {
+		log.Printf("failed to send auth confirmation to %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+
+	log.Printf("authenticated client %s", conn.RemoteAddr())
 
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Printf("server@%s> ", conn.RemoteAddr())
@@ -69,11 +85,41 @@ func handleSession(conn net.Conn) {
 	}
 }
 
+func authenticateClient(conn net.Conn, expectedToken string) error {
+	if expectedToken == "" {
+		return errors.New("empty expected token")
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return err
+	}
+	authMsg, err := protocol.ReadFrame(conn)
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return errors.New("client closed before auth")
+		}
+		return err
+	}
+
+	parts := strings.Fields(authMsg)
+	if len(parts) != 2 || parts[0] != "auth" {
+		return fmt.Errorf("invalid auth message")
+	}
+
+	if parts[1] != expectedToken {
+		return errors.New("invalid token")
+	}
+
+	return nil
+}
+
 func main() {
 	listenAddr := flag.String("listen", ":9898", "TCP address to listen on")
+	token := flag.String("token", "tp-secret", "shared authentication token")
 	flag.Parse()
 
-	if err := startServer(*listenAddr); err != nil {
+	if err := startServer(*listenAddr, *token); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -94,6 +94,15 @@ exit
 - Explain risks of executing arbitrary shell commands.
 - Propose two mitigations for production use.
 
+## CI/CD
+
+GitHub Actions runs on every push and PR to `main`:
+- Format check with `gofmt`
+- Vet with `go vet`
+- Tests with `go test -race`
+- Build validation for both server and client
+- Tests run on Go 1.22 and 1.23
+
 ## Notes
 
 This project is intentionally educational and minimal. Do not expose it on untrusted networks.

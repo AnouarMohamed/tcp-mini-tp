@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ["1.22", "1.23"]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ matrix.go-version }}
+      
+      - name: Format check
+        run: |
+          if [ -n "$(gofmt -s -l .)" ]; then
+            echo "Go files need formatting:"
+            gofmt -s -d .
+            exit 1
+          fi
+      
+      - name: Vet
+        run: go vet ./...
+      
+      - name: Test
+        run: go test -v -race -cover ./...
+      
+      - name: Build server
+        run: go build -o bin/server ./server
+      
+      - name: Build client
+        run: go build -o bin/client ./client
+      
+      - name: Verify binaries exist
+        run: |
+          test -f bin/server || (echo "server binary not found" && exit 1)
+          test -f bin/client || (echo "client binary not found" && exit 1)
