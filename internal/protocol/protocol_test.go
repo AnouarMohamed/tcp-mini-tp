@@ -33,10 +33,14 @@ func TestWriteReadFrameRoundTrip(t *testing.T) {
 }
 
 func TestReadFrameEOF(t *testing.T) {
-	_, client := net.Pipe()
+	server, client := net.Pipe()
+	defer server.Close()
 	defer client.Close()
 
-	_, err := ReadFrame(client)
+	// Close client to signal EOF to server
+	client.Close()
+
+	_, err := ReadFrame(server)
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("expected io.EOF, got %v", err)
 	}
