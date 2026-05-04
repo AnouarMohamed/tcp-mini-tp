@@ -1,2 +1,9 @@
 bin/
 commands.log
+*.pem
+coverage.out
+logs/
+server/key.pem
+server/cert.pem
+key.pem
+cert.pem
