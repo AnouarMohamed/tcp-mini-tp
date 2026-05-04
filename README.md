@@ -126,6 +126,51 @@ Then connect the client:
 go run ./client -server localhost:9898 -token s3cr3t
 ```
 
+### Modes & Menu
+
+When the server starts it now presents a small ASCII menu *before* it begins accepting connections. Choose the session mode once at startup; that mode will be used for all subsequent client sessions until the server is restarted.
+
+Example server startup and menu flow:
+
+```bash
+# start server (interactive menu appears before listening)
+go run ./server -listen :9898 -token s3cr3t
+
+# Menu (example)
+# ======================
+#  TCP Mini-TP
+#
+# 1) chat   — free-form text chat
+# 2) exec   — auto-prefixes operator input with "command "
+# 3) shell  — kick off a persistent remote shell session
+#
+# Choose mode: 2
+```
+
+Modes quick reference:
+
+- `chat`: operator types plain lines; they are forwarded verbatim to the client and printed by the client.
+- `exec`: operator lines are prefixed with `command ` (unless they already start with `command ` or `info `) so the client will treat them as allowlisted commands.
+- `shell`: the server sends a `shell` kickoff frame when a client connects and the client will enter a persistent shell session; use `shell exit` to close it.
+
+Sample interactive run (server in `exec` mode):
+
+```bash
+# terminal A (server)
+go run ./server -listen :9898 -token s3cr3t
+# choose: 2 (exec)
+
+# terminal B (client)
+go run ./client -server localhost:9898 -token s3cr3t
+
+# terminal A types:
+command whoami
+
+# terminal A sees returned output from client
+```
+
+If you'd like, I can add a small demo script that automates starting the server and client (for local tests), or update the README further with screenshots trimmed for any sensitive tokens.
+
 ## Screenshot Gallery
 
 All screenshots live in `screenshots/`.
