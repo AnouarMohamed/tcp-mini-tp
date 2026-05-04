@@ -14,12 +14,18 @@ jobs:
         go-version: ["1.22", "1.23"]
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
           go-version: ${{ matrix.go-version }}
-      
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: v1.57.2
+          args: --config=.golangci.yml
+
       - name: Format check
         run: |
           if [ -n "$(gofmt -s -l .)" ]; then
@@ -27,19 +33,19 @@ jobs:
             gofmt -s -d .
             exit 1
           fi
-      
+
       - name: Vet
         run: go vet ./...
-      
+
       - name: Test
         run: go test -v -race -cover ./...
-      
+
       - name: Build server
         run: go build -o bin/server ./server
-      
+
       - name: Build client
         run: go build -o bin/client ./client
-      
+
       - name: Verify binaries exist
         run: |
           test -f bin/server || (echo "server binary not found" && exit 1)

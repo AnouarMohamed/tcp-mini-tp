@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -22,6 +22,8 @@ const (
 	serverHeartbeatInterval = 30 * time.Second
 	serverHeartbeatTimeout  = 5 * time.Second
 )
+
+var logger = slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("component", "server")
 
 type sessionManager struct {
 	mu     sync.Mutex
@@ -82,7 +84,7 @@ func startServer(ctx context.Context, listenAddr, token, certFile, keyFile strin
 		manager.closeActive()
 	}()
 
-	log.Printf("server listening on %s (TLS)", listenAddr)
+	logger.Info("server listening", "remote_addr", listenAddr, "event", "listener_started")
 
 	for {
 		conn, err := listener.Accept()
@@ -90,11 +92,12 @@ func startServer(ctx context.Context, listenAddr, token, certFile, keyFile strin
 			if ctx.Err() != nil {
 				return nil
 			}
-			log.Printf("accept error: %v", err)
+			logger.Error("accept error", "remote_addr", "", "event", "accept_error", "error", err)
 			continue
 		}
 
 		if !manager.tryAcquire(conn) {
+			logger.Warn("session rejected", "remote_addr", conn.RemoteAddr().String(), "event", "session_busy")
 			_ = protocol.WriteFrame(conn, "server_busy")
 			_ = conn.Close()
 			continue
@@ -113,18 +116,20 @@ func handleSession(parentCtx context.Context, conn net.Conn, token string) {
 	sessionCtx, cancel := context.WithCancel(parentCtx)
 	defer cancel()
 
+	remoteAddr := conn.RemoteAddr().String()
+
 	if err := authenticateClient(conn, token); err != nil {
-		log.Printf("authentication failed for %s: %v", conn.RemoteAddr(), err)
+		logger.Warn("authentication failed", "remote_addr", remoteAddr, "event", "authentication_failed", "error", err)
 		_ = protocol.WriteFrame(conn, "auth_fail")
 		return
 	}
 
 	if err := protocol.WriteFrame(conn, "auth_ok"); err != nil {
-		log.Printf("failed to send auth confirmation to %s: %v", conn.RemoteAddr(), err)
+		logger.Error("failed to send auth confirmation", "remote_addr", remoteAddr, "event", "auth_confirmation_failed", "error", err)
 		return
 	}
 
-	log.Printf("authenticated client %s", conn.RemoteAddr())
+	logger.Info("authenticated client", "remote_addr", remoteAddr, "event", "authenticated")
 
 	writeMu := &sync.Mutex{}
 	responses := make(chan string, 8)
@@ -135,7 +140,7 @@ func handleSession(parentCtx context.Context, conn net.Conn, token string) {
 	go serverHeartbeatLoop(sessionCtx, cancel, conn, writeMu, pongs, errCh)
 
 	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Printf("server@%s> ", conn.RemoteAddr())
+	fmt.Printf("server@%s> ", remoteAddr)
 	for scanner.Scan() {
 		select {
 		case <-sessionCtx.Done():
@@ -145,32 +150,32 @@ func handleSession(parentCtx context.Context, conn net.Conn, token string) {
 
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
-			fmt.Printf("server@%s> ", conn.RemoteAddr())
+			fmt.Printf("server@%s> ", remoteAddr)
 			continue
 		}
 
 		if err := serverWriteFrame(writeMu, conn, line); err != nil {
-			log.Printf("send error: %v", err)
+			logger.Error("send error", "remote_addr", remoteAddr, "event", "send_error", "error", err)
 			return
 		}
 
 		if line == "exit" {
-			log.Printf("closing session with %s", conn.RemoteAddr())
+			logger.Info("closing session", "remote_addr", remoteAddr, "event", "session_closed")
 			return
 		}
 
 		reply, err := waitForServerResponse(sessionCtx, responses, errCh)
 		if err != nil {
-			log.Printf("receive error: %v", err)
+			logger.Error("receive error", "remote_addr", remoteAddr, "event", "receive_error", "error", err)
 			return
 		}
 
 		fmt.Printf("client output:\n%s\n", reply)
-		fmt.Printf("server@%s> ", conn.RemoteAddr())
+		fmt.Printf("server@%s> ", remoteAddr)
 	}
 
 	if err := scanner.Err(); err != nil {
-		log.Printf("stdin error: %v", err)
+		logger.Error("stdin error", "remote_addr", remoteAddr, "event", "stdin_error", "error", err)
 	}
 }
 
@@ -252,7 +257,9 @@ func serverHeartbeatLoop(ctx context.Context, cancel context.CancelFunc, conn ne
 			timeout := time.NewTimer(serverHeartbeatTimeout)
 			select {
 			case <-pongs:
-				timeout.Stop()
+				if !timeout.Stop() {
+					<-timeout.C
+				}
 			case <-timeout.C:
 				select {
 				case errCh <- fmt.Errorf("heartbeat timeout waiting for pong"):
@@ -262,7 +269,9 @@ func serverHeartbeatLoop(ctx context.Context, cancel context.CancelFunc, conn ne
 				_ = conn.Close()
 				return
 			case <-ctx.Done():
-				timeout.Stop()
+				if !timeout.Stop() {
+					<-timeout.C
+				}
 				return
 			}
 		}

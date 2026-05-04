@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -20,6 +19,7 @@ func main() {
 	defer stop()
 
 	if err := startServer(ctx, *listenAddr, *token, *certFile, *keyFile); err != nil {
-		log.Fatal(err)
+		logger.Error("fatal error", "remote_addr", *listenAddr, "event", "fatal", "error", err)
+		os.Exit(1)
 	}
 }

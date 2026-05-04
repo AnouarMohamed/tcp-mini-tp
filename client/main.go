@@ -9,7 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -31,14 +31,19 @@ var (
 	defaultAllowedCommands = []string{"pwd", "ls", "whoami", "uname", "date", "echo", "cat", "id", "cd"}
 	errAuthRejected        = errors.New("authentication rejected")
 	errServerBusy          = errors.New("server busy")
+	connectAndServeFn      = connectAndServe
+	runClientSessionFn     = runClientSession
+	sleepFn                = time.Sleep
 )
+
+var logger = slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("component", "client")
 
 func connectAndServe(serverAddr, token string, certPEM []byte, allowed map[string]struct{}, maxRetries int) error {
 	delay := time.Second
 	attempt := 0
 
 	for {
-		err := runClientSession(serverAddr, token, certPEM, allowed)
+		err := runClientSessionFn(serverAddr, token, certPEM, allowed)
 		if err == nil {
 			return nil
 		}
@@ -50,8 +55,8 @@ func connectAndServe(serverAddr, token string, certPEM []byte, allowed map[strin
 		}
 
 		attempt++
-		log.Printf("session ended: %v; reconnecting in %s", err, delay)
-		time.Sleep(delay)
+		logger.Warn("session ended, reconnecting", "remote_addr", serverAddr, "event", "reconnect", "attempt", attempt, "delay", delay.String(), "error", err)
+		sleepFn(delay)
 		delay *= 2
 		if delay > 30*time.Second {
 			delay = 30 * time.Second
@@ -71,11 +76,11 @@ func runClientSession(serverAddr, token string, certPEM []byte, allowed map[stri
 	}
 	defer conn.Close()
 
-	log.Printf("connected to server %s (TLS)", serverAddr)
+	logger.Info("connected to server", "remote_addr", serverAddr, "event", "connected")
 	if err := authenticate(conn, token); err != nil {
 		return err
 	}
-	log.Print("authentication completed")
+	logger.Info("authentication completed", "remote_addr", serverAddr, "event", "authenticated")
 
 	writeMu := &sync.Mutex{}
 	sessionErr := make(chan error, 1)
@@ -150,7 +155,7 @@ func clientReadLoop(ctx context.Context, cancel context.CancelFunc, conn net.Con
 			return
 		}
 
-		log.Printf("received command: %s", msg)
+		logger.Info("received command", "remote_addr", conn.RemoteAddr().String(), "event", "command_received", "command", msg)
 
 		switch strings.TrimSpace(msg) {
 		case heartbeatPing:
@@ -163,7 +168,7 @@ func clientReadLoop(ctx context.Context, cancel context.CancelFunc, conn net.Con
 				return
 			}
 		case "exit":
-			log.Print("server requested exit")
+			logger.Info("server requested exit", "remote_addr", conn.RemoteAddr().String(), "event", "exit")
 			cancel()
 			select {
 			case sessionErr <- nil:
@@ -190,7 +195,12 @@ func waitForSessionEnd(ctx context.Context, sessionErr <-chan error) error {
 	case err := <-sessionErr:
 		return err
 	case <-ctx.Done():
-		return ctx.Err()
+		select {
+		case err := <-sessionErr:
+			return err
+		default:
+			return ctx.Err()
+		}
 	}
 }
 
@@ -299,11 +309,13 @@ func main() {
 		var err error
 		certPEM, err = os.ReadFile(*certFile)
 		if err != nil {
-			log.Fatalf("failed to read certificate file: %v", err)
+			logger.Error("failed to read certificate file", "remote_addr", *serverAddr, "event", "cert_read_error", "error", err)
+			os.Exit(1)
 		}
 	}
 
-	if err := connectAndServe(*serverAddr, *token, certPEM, allowed, *maxRetries); err != nil {
-		log.Fatal(err)
+	if err := connectAndServeFn(*serverAddr, *token, certPEM, allowed, *maxRetries); err != nil {
+		logger.Error("fatal error", "remote_addr", *serverAddr, "event", "fatal", "error", err)
+		os.Exit(1)
 	}
 }
