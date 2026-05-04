@@ -56,7 +56,7 @@ jobs:
         run: go build -o bin/tcp-client-${{ matrix.suffix }} ./client
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.suffix }}
           path: bin/
@@ -74,7 +74,7 @@ jobs:
           path: artifacts/
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           files: artifacts/*/*
           draft: false
