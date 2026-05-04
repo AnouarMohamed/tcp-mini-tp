@@ -6,8 +6,42 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+  checks: write
+
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.23"
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: v1.57.2
+          args: --config=.golangci.yml
+
+      - name: Check formatting
+        run: |
+          if [ -n "$(gofmt -s -l .)" ]; then
+            echo "❌ Go files need formatting:"
+            gofmt -s -d .
+            exit 1
+          fi
+          echo "✅ All Go files are properly formatted"
+
+      - name: Run go vet
+        run: go vet ./...
+
   test:
+    name: Test (Go ${{ matrix.go-version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -20,25 +54,27 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
 
-      - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v4
+      - name: Run tests with race detector
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
         with:
-          version: v1.57.2
-          args: --config=.golangci.yml
+          files: ./coverage.out
+          flags: go-${{ matrix.go-version }}
+          fail_ci_if_error: false
 
-      - name: Format check
-        run: |
-          if [ -n "$(gofmt -s -l .)" ]; then
-            echo "Go files need formatting:"
-            gofmt -s -d .
-            exit 1
-          fi
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test
-        run: go test -v -race -cover ./...
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.23"
 
       - name: Build server
         run: go build -o bin/server ./server
@@ -48,5 +84,6 @@ jobs:
 
       - name: Verify binaries exist
         run: |
-          test -f bin/server || (echo "server binary not found" && exit 1)
-          test -f bin/client || (echo "client binary not found" && exit 1)
+          test -f bin/server || (echo "❌ server binary not found" && exit 1)
+          test -f bin/client || (echo "❌ client binary not found" && exit 1)
+          echo "✅ Both binaries built successfully"

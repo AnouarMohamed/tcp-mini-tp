@@ -1,0 +1,23 @@
+# Code ownership rules
+# Automatically request code reviews from these owners
+
+# Core project files
+*.md @AnouarMohamed
+.github/ @AnouarMohamed
+
+# Go source files
+*.go @AnouarMohamed
+
+# Build and dependency configs
+go.mod @AnouarMohamed
+go.sum @AnouarMohamed
+Makefile @AnouarMohamed
+
+# Server code
+server/ @AnouarMohamed
+
+# Client code
+client/ @AnouarMohamed
+
+# Shared code
+internal/ @AnouarMohamed
