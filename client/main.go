@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -14,31 +15,54 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"tcp-mini-tp/internal/protocol"
 )
 
-const maxOutputSize = 64 * 1024 // 64 KB cap on command output
+const (
+	maxOutputSize = 64 * 1024
+	heartbeatPing = "ping"
+	heartbeatPong = "pong"
+)
 
-var defaultAllowedCommands = []string{"pwd", "ls", "whoami", "uname", "date", "echo", "cat", "id", "cd"}
+var (
+	defaultAllowedCommands = []string{"pwd", "ls", "whoami", "uname", "date", "echo", "cat", "id", "cd"}
+	errAuthRejected        = errors.New("authentication rejected")
+	errServerBusy          = errors.New("server busy")
+)
 
-func connectAndServe(serverAddr, token string, certPEM []byte, allowed map[string]struct{}) error {
-	// Create TLS config
-	var tlsConfig *tls.Config
+func connectAndServe(serverAddr, token string, certPEM []byte, allowed map[string]struct{}, maxRetries int) error {
+	delay := time.Second
+	attempt := 0
 
-	if len(certPEM) > 0 {
-		certPool := x509.NewCertPool()
-		if !certPool.AppendCertsFromPEM(certPEM) {
-			return errors.New("failed to parse certificate")
+	for {
+		err := runClientSession(serverAddr, token, certPEM, allowed)
+		if err == nil {
+			return nil
 		}
-		tlsConfig = &tls.Config{
-			RootCAs: certPool,
+		if errors.Is(err, errAuthRejected) {
+			return err
 		}
-	} else {
-		// InsecureSkipVerify for self-signed certs without explicit cert file
-		tlsConfig = &tls.Config{
-			InsecureSkipVerify: true,
+		if maxRetries >= 0 && attempt >= maxRetries {
+			return fmt.Errorf("max retries reached after %d attempts: %w", attempt, err)
 		}
+
+		attempt++
+		log.Printf("session ended: %v; reconnecting in %s", err, delay)
+		time.Sleep(delay)
+		delay *= 2
+		if delay > 30*time.Second {
+			delay = 30 * time.Second
+		}
+	}
+}
+
+func runClientSession(serverAddr, token string, certPEM []byte, allowed map[string]struct{}) error {
+	tlsConfig, err := buildTLSConfig(serverAddr, certPEM)
+	if err != nil {
+		return err
 	}
 
 	conn, err := tls.Dial("tcp", serverAddr, tlsConfig)
@@ -53,24 +77,38 @@ func connectAndServe(serverAddr, token string, certPEM []byte, allowed map[strin
 	}
 	log.Print("authentication completed")
 
-	for {
-		msg, err := protocol.ReadFrame(conn)
-		if err != nil {
-			return err
-		}
+	writeMu := &sync.Mutex{}
+	sessionErr := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-		log.Printf("received command: %s", msg)
+	go clientReadLoop(ctx, cancel, conn, writeMu, allowed, sessionErr)
 
-		if strings.TrimSpace(msg) == "exit" {
-			log.Print("server requested exit")
-			return nil
-		}
-
-		resp := execute(msg, allowed)
-		if err := protocol.WriteFrame(conn, resp); err != nil {
-			return err
-		}
+	if err := waitForSessionEnd(ctx, sessionErr); err != nil {
+		return err
 	}
+	return nil
+}
+
+func buildTLSConfig(serverAddr string, certPEM []byte) (*tls.Config, error) {
+	host := serverAddr
+	if parsedHost, _, err := net.SplitHostPort(serverAddr); err == nil {
+		host = parsedHost
+	}
+
+	config := &tls.Config{MinVersion: tls.VersionTLS12}
+	if len(certPEM) > 0 {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(certPEM) {
+			return nil, errors.New("failed to parse certificate")
+		}
+		config.RootCAs = pool
+		config.ServerName = host
+		return config, nil
+	}
+
+	config.InsecureSkipVerify = true
+	return config, nil
 }
 
 func authenticate(conn net.Conn, token string) error {
@@ -90,11 +128,76 @@ func authenticate(conn net.Conn, token string) error {
 		return err
 	}
 
-	if status != "auth_ok" {
-		return fmt.Errorf("authentication rejected by server: %s", status)
+	switch status {
+	case "auth_ok":
+		return nil
+	case "server_busy":
+		return errServerBusy
+	default:
+		return errAuthRejected
 	}
+}
 
-	return nil
+func clientReadLoop(ctx context.Context, cancel context.CancelFunc, conn net.Conn, writeMu *sync.Mutex, allowed map[string]struct{}, sessionErr chan<- error) {
+	for {
+		msg, err := protocol.ReadFrame(conn)
+		if err != nil {
+			select {
+			case sessionErr <- err:
+			default:
+			}
+			cancel()
+			return
+		}
+
+		log.Printf("received command: %s", msg)
+
+		switch strings.TrimSpace(msg) {
+		case heartbeatPing:
+			if err := clientWriteFrame(writeMu, conn, heartbeatPong); err != nil {
+				select {
+				case sessionErr <- err:
+				default:
+				}
+				cancel()
+				return
+			}
+		case "exit":
+			log.Print("server requested exit")
+			cancel()
+			select {
+			case sessionErr <- nil:
+			default:
+			}
+			return
+		default:
+			go func(command string) {
+				response := execute(command, allowed)
+				if err := clientWriteFrame(writeMu, conn, response); err != nil {
+					select {
+					case sessionErr <- err:
+					default:
+					}
+					cancel()
+				}
+			}(msg)
+		}
+	}
+}
+
+func waitForSessionEnd(ctx context.Context, sessionErr <-chan error) error {
+	select {
+	case err := <-sessionErr:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func clientWriteFrame(writeMu *sync.Mutex, conn net.Conn, payload string) error {
+	writeMu.Lock()
+	defer writeMu.Unlock()
+	return protocol.WriteFrame(conn, payload)
 }
 
 func execute(raw string, allowed map[string]struct{}) string {
@@ -133,13 +236,11 @@ func execute(raw string, allowed map[string]struct{}) string {
 		return fmt.Sprintf("changed directory to %s", path)
 	}
 
-	// Resolve command using exec.LookPath (prevents path traversal bypass)
 	resolvedPath, err := exec.LookPath(fields[1])
 	if err != nil {
 		return fmt.Sprintf("command not found: %s", fields[1])
 	}
 
-	// Check against whitelist using basename of resolved path
 	base := filepath.Base(resolvedPath)
 	if _, ok := allowed[base]; !ok {
 		return fmt.Sprintf("blocked command: %s (not in whitelist)", base)
@@ -151,7 +252,6 @@ func execute(raw string, allowed map[string]struct{}) string {
 		return fmt.Sprintf("command error: %v\n%s", err, string(output))
 	}
 
-	// Cap output at 64KB using io.LimitedReader
 	limitedOutput := io.LimitedReader{R: bytes.NewReader(output), N: maxOutputSize}
 	cappedOutput, _ := io.ReadAll(&limitedOutput)
 
@@ -189,6 +289,7 @@ func main() {
 	token := flag.String("token", "tp-secret", "shared authentication token")
 	certFile := flag.String("cert", "", "path to TLS certificate file (optional, uses InsecureSkipVerify if not provided)")
 	allowlist := flag.String("allow", "pwd,ls,whoami,uname,date,echo,cat,id,cd", "comma-separated whitelist for allowed commands")
+	maxRetries := flag.Int("max-retries", 5, "maximum reconnect attempts after a dropped session")
 	flag.Parse()
 
 	allowed := parseAllowlist(*allowlist)
@@ -202,7 +303,7 @@ func main() {
 		}
 	}
 
-	if err := connectAndServe(*serverAddr, *token, certPEM, allowed); err != nil {
+	if err := connectAndServe(*serverAddr, *token, certPEM, allowed, *maxRetries); err != nil {
 		log.Fatal(err)
 	}
 }

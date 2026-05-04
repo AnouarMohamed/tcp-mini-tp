@@ -1,0 +1,290 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"crypto/subtle"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"tcp-mini-tp/internal/protocol"
+)
+
+const (
+	serverHeartbeatInterval = 30 * time.Second
+	serverHeartbeatTimeout  = 5 * time.Second
+)
+
+type sessionManager struct {
+	mu     sync.Mutex
+	active net.Conn
+}
+
+func (m *sessionManager) tryAcquire(conn net.Conn) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.active != nil {
+		return false
+	}
+
+	m.active = conn
+	return true
+}
+
+func (m *sessionManager) release(conn net.Conn) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.active == conn {
+		m.active = nil
+	}
+}
+
+func (m *sessionManager) closeActive() {
+	m.mu.Lock()
+	active := m.active
+	m.mu.Unlock()
+
+	if active != nil {
+		_ = active.Close()
+	}
+}
+
+func startServer(ctx context.Context, listenAddr, token, certFile, keyFile string) error {
+	if err := GenerateSelfSignedCert(certFile, keyFile); err != nil {
+		return fmt.Errorf("cert generation failed: %w", err)
+	}
+
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return fmt.Errorf("failed to load TLS cert: %w", err)
+	}
+
+	listener, err := tls.Listen("tcp", listenAddr, &tls.Config{Certificates: []tls.Certificate{cert}})
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+
+	manager := &sessionManager{}
+	go func() {
+		<-ctx.Done()
+		_ = listener.Close()
+		manager.closeActive()
+	}()
+
+	log.Printf("server listening on %s (TLS)", listenAddr)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			log.Printf("accept error: %v", err)
+			continue
+		}
+
+		if !manager.tryAcquire(conn) {
+			_ = protocol.WriteFrame(conn, "server_busy")
+			_ = conn.Close()
+			continue
+		}
+
+		go func(c net.Conn) {
+			defer manager.release(c)
+			handleSession(ctx, c, token)
+		}(conn)
+	}
+}
+
+func handleSession(parentCtx context.Context, conn net.Conn, token string) {
+	defer conn.Close()
+
+	sessionCtx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
+	if err := authenticateClient(conn, token); err != nil {
+		log.Printf("authentication failed for %s: %v", conn.RemoteAddr(), err)
+		_ = protocol.WriteFrame(conn, "auth_fail")
+		return
+	}
+
+	if err := protocol.WriteFrame(conn, "auth_ok"); err != nil {
+		log.Printf("failed to send auth confirmation to %s: %v", conn.RemoteAddr(), err)
+		return
+	}
+
+	log.Printf("authenticated client %s", conn.RemoteAddr())
+
+	writeMu := &sync.Mutex{}
+	responses := make(chan string, 8)
+	pongs := make(chan struct{}, 4)
+	errCh := make(chan error, 1)
+
+	go serverReadLoop(sessionCtx, cancel, conn, responses, pongs, errCh)
+	go serverHeartbeatLoop(sessionCtx, cancel, conn, writeMu, pongs, errCh)
+
+	scanner := bufio.NewScanner(os.Stdin)
+	fmt.Printf("server@%s> ", conn.RemoteAddr())
+	for scanner.Scan() {
+		select {
+		case <-sessionCtx.Done():
+			return
+		default:
+		}
+
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			fmt.Printf("server@%s> ", conn.RemoteAddr())
+			continue
+		}
+
+		if err := serverWriteFrame(writeMu, conn, line); err != nil {
+			log.Printf("send error: %v", err)
+			return
+		}
+
+		if line == "exit" {
+			log.Printf("closing session with %s", conn.RemoteAddr())
+			return
+		}
+
+		reply, err := waitForServerResponse(sessionCtx, responses, errCh)
+		if err != nil {
+			log.Printf("receive error: %v", err)
+			return
+		}
+
+		fmt.Printf("client output:\n%s\n", reply)
+		fmt.Printf("server@%s> ", conn.RemoteAddr())
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("stdin error: %v", err)
+	}
+}
+
+func authenticateClient(conn net.Conn, expectedToken string) error {
+	if expectedToken == "" {
+		return errors.New("empty expected token")
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return err
+	}
+	authMsg, err := protocol.ReadFrame(conn)
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return errors.New("client closed before auth")
+		}
+		return err
+	}
+
+	parts := strings.Fields(authMsg)
+	if len(parts) != 2 || parts[0] != "auth" {
+		return fmt.Errorf("invalid auth message")
+	}
+
+	if subtle.ConstantTimeCompare([]byte(parts[1]), []byte(expectedToken)) != 1 {
+		return errors.New("invalid token")
+	}
+
+	return nil
+}
+
+func serverReadLoop(ctx context.Context, cancel context.CancelFunc, conn net.Conn, responses chan<- string, pongs chan<- struct{}, errCh chan<- error) {
+	for {
+		msg, err := protocol.ReadFrame(conn)
+		if err != nil {
+			select {
+			case errCh <- err:
+			default:
+			}
+			cancel()
+			return
+		}
+
+		switch msg {
+		case "pong":
+			select {
+			case pongs <- struct{}{}:
+			default:
+			}
+		default:
+			select {
+			case responses <- msg:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func serverHeartbeatLoop(ctx context.Context, cancel context.CancelFunc, conn net.Conn, writeMu *sync.Mutex, pongs <-chan struct{}, errCh chan<- error) {
+	ticker := time.NewTicker(serverHeartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := serverWriteFrame(writeMu, conn, "ping"); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				cancel()
+				return
+			}
+
+			timeout := time.NewTimer(serverHeartbeatTimeout)
+			select {
+			case <-pongs:
+				timeout.Stop()
+			case <-timeout.C:
+				select {
+				case errCh <- fmt.Errorf("heartbeat timeout waiting for pong"):
+				default:
+				}
+				cancel()
+				_ = conn.Close()
+				return
+			case <-ctx.Done():
+				timeout.Stop()
+				return
+			}
+		}
+	}
+}
+
+func serverWriteFrame(writeMu *sync.Mutex, conn net.Conn, payload string) error {
+	writeMu.Lock()
+	defer writeMu.Unlock()
+	return protocol.WriteFrame(conn, payload)
+}
+
+func waitForServerResponse(ctx context.Context, responses <-chan string, errCh <-chan error) (string, error) {
+	select {
+	case resp := <-responses:
+		return resp, nil
+	case err := <-errCh:
+		if err == nil {
+			return "", errors.New("session closed")
+		}
+		return "", err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}

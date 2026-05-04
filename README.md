@@ -32,6 +32,13 @@ TP2 hardening has been added:
    - Prevents memory exhaustion from large command outputs
    - Uses `io.LimitedReader`
 
+## Architectural Improvements
+
+- Single active session enforced by a server-side mutex
+- Graceful shutdown on `SIGINT` and `SIGTERM`
+- Client reconnects with exponential backoff up to 30s
+- Heartbeat ping/pong every 30s with 5s timeout
+
 ## Project Structure
 
 - `server/main.go`: server executable (listens, sends commands, prints client output)
@@ -75,7 +82,7 @@ The first run will auto-generate `cert.pem` and `key.pem`.
 Terminal 2 (client):
 
 ```bash
-go run ./client -server localhost:9898 -token tp-secret
+go run ./client -server localhost:9898 -token tp-secret -max-retries 5
 ```
 
 Optional: Use explicit certificate (for production verification):
@@ -90,11 +97,21 @@ Optional: customize allowed commands on the client:
 go run ./client -server localhost:9898 -token tp-secret -allow "pwd,ls,whoami,cd"
 ```
 
+Optional: adjust reconnect behavior:
+
+```bash
+go run ./client -server localhost:9898 -token tp-secret -max-retries 10
+```
+
 ## Usage
 
 Type commands in the server terminal.
 
 The reverse command channel is still present: the server sends commands, the client executes them, and returns output.
+
+The server now keeps one active session at a time. If a second client connects while a session is active, it is refused with `server_busy`.
+
+The server also sends `ping` every 30 seconds. The client answers with `pong` and the session is closed if no pong arrives within 5 seconds.
 
 - To execute a shell command on the client:
 
