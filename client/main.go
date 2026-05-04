@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -89,6 +90,7 @@ func runClientSession(serverAddr, token string, certPEM []byte, allowed map[stri
 	defer cancel()
 
 	go clientReadLoop(ctx, cancel, conn, writeMu, allowed, shellMgr, sessionErr)
+	go clientStdinLoop(ctx, cancel, conn, writeMu, sessionErr)
 
 	if err := waitForSessionEnd(ctx, sessionErr); err != nil {
 		return err
@@ -141,6 +143,52 @@ func authenticate(conn net.Conn, token string) error {
 		return errServerBusy
 	default:
 		return errAuthRejected
+	}
+}
+
+func clientStdinLoop(ctx context.Context, cancel context.CancelFunc, conn net.Conn, writeMu *sync.Mutex, sessionErr chan<- error) {
+	scanner := bufio.NewScanner(os.Stdin)
+	fmt.Print("client> ")
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			fmt.Print("client> ")
+			continue
+		}
+
+		if err := clientWriteFrame(writeMu, conn, line); err != nil {
+			select {
+			case sessionErr <- err:
+			default:
+			}
+			cancel()
+			return
+		}
+
+		if line == "exit" {
+			cancel()
+			select {
+			case sessionErr <- nil:
+			default:
+			}
+			return
+		}
+
+		fmt.Print("client> ")
+	}
+
+	if err := scanner.Err(); err != nil {
+		select {
+		case sessionErr <- err:
+		default:
+		}
+		cancel()
 	}
 }
 
@@ -254,16 +302,31 @@ func clientReadLoop(ctx context.Context, cancel context.CancelFunc, conn net.Con
 				continue
 			}
 
-			go func(command string) {
-				response := execute(command, allowed)
-				if err := clientWriteFrame(writeMu, conn, response); err != nil {
-					select {
-					case sessionErr <- err:
-					default:
+			if strings.HasPrefix(trimmed, "command ") || strings.HasPrefix(trimmed, "info ") {
+				go func(command string) {
+					response := execute(command, allowed)
+					if err := clientWriteFrame(writeMu, conn, response); err != nil {
+						select {
+						case sessionErr <- err:
+						default:
+						}
+						cancel()
 					}
-					cancel()
+				}(msg)
+				continue
+			}
+
+			if trimmed == "exit" {
+				logger.Info("server requested exit", "remote_addr", conn.RemoteAddr().String(), "event", "exit")
+				cancel()
+				select {
+				case sessionErr <- nil:
+				default:
 				}
-			}(msg)
+				return
+			}
+
+			fmt.Printf("\nserver: %s\nclient> ", msg)
 		}
 	}
 }

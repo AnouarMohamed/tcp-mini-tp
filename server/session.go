@@ -23,14 +23,16 @@ const (
 	serverHeartbeatTimeout  = 5 * time.Second
 )
 
-var logger = slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("component", "server")
-
 type sessionMode string
 
 const (
 	normalMode sessionMode = "normal"
 	shellMode  sessionMode = "shell"
+	chatMode   sessionMode = "chat"
+	execMode   sessionMode = "exec"
 )
+
+var logger = slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("component", "server")
 
 type sessionManager struct {
 	mu     sync.Mutex
@@ -84,6 +86,9 @@ func startServer(ctx context.Context, listenAddr, token, certFile, keyFile strin
 	}
 	defer listener.Close()
 
+	stdinScanner := bufio.NewScanner(os.Stdin)
+	mode := selectSessionMode(stdinScanner, listenAddr)
+
 	manager := &sessionManager{}
 	go func() {
 		<-ctx.Done()
@@ -112,12 +117,12 @@ func startServer(ctx context.Context, listenAddr, token, certFile, keyFile strin
 
 		go func(c net.Conn) {
 			defer manager.release(c)
-			handleSession(ctx, c, token)
+			handleSession(ctx, c, token, stdinScanner, mode)
 		}(conn)
 	}
 }
 
-func handleSession(parentCtx context.Context, conn net.Conn, token string) {
+func handleSession(parentCtx context.Context, conn net.Conn, token string, scanner *bufio.Scanner, mode sessionMode) {
 	defer conn.Close()
 
 	sessionCtx, cancel := context.WithCancel(parentCtx)
@@ -139,123 +144,21 @@ func handleSession(parentCtx context.Context, conn net.Conn, token string) {
 	logger.Info("authenticated client", "remote_addr", remoteAddr, "event", "authenticated")
 
 	writeMu := &sync.Mutex{}
-	responses := make(chan string, 8)
 	pongs := make(chan struct{}, 4)
 	errCh := make(chan error, 1)
-
-	go serverReadLoop(sessionCtx, cancel, conn, responses, pongs, errCh)
-	go serverHeartbeatLoop(sessionCtx, cancel, conn, writeMu, pongs, errCh)
-
-	mode := normalMode
-	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
-	for scanner.Scan() {
-		select {
-		case <-sessionCtx.Done():
+	if mode == shellMode {
+		if err := serverWriteFrame(writeMu, conn, "shell"); err != nil {
+			logger.Error("failed to start shell mode", "remote_addr", remoteAddr, "event", "shell_start_failed", "error", err)
 			return
-		default:
 		}
-
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
-			continue
-		}
-
-		if err := appendCommandHistory(commandHistoryEntry{
-			Timestamp:  time.Now().UTC(),
-			Component:  "server",
-			RemoteAddr: remoteAddr,
-			Event:      "repl_command",
-			Mode:       string(mode),
-			Command:    line,
-		}); err != nil {
-			logger.Warn("history append failed", "remote_addr", remoteAddr, "event", "history_append_failed", "error", err)
-		}
-
-		if line == "history" {
-			showCommandHistory(remoteAddr)
-			fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
-			continue
-		}
-
-		switch mode {
-		case normalMode:
-			if line == "shell" {
-				if err := serverWriteFrame(writeMu, conn, line); err != nil {
-					logger.Error("send error", "remote_addr", remoteAddr, "event", "send_error", "error", err)
-					return
-				}
-
-				reply, err := waitForServerResponse(sessionCtx, responses, errCh)
-				if err != nil {
-					logger.Error("receive error", "remote_addr", remoteAddr, "event", "receive_error", "error", err)
-					return
-				}
-				if reply == "shell_ready" {
-					mode = shellMode
-					fmt.Printf("shell@%s> ", remoteAddr)
-					continue
-				}
-				fmt.Printf("client output:\n%s\n", reply)
-				fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
-				continue
-			}
-
-			if err := serverWriteFrame(writeMu, conn, line); err != nil {
-				logger.Error("send error", "remote_addr", remoteAddr, "event", "send_error", "error", err)
-				return
-			}
-
-			if line == "exit" {
-				logger.Info("closing session", "remote_addr", remoteAddr, "event", "session_closed")
-				return
-			}
-
-			reply, err := waitForServerResponse(sessionCtx, responses, errCh)
-			if err != nil {
-				logger.Error("receive error", "remote_addr", remoteAddr, "event", "receive_error", "error", err)
-				return
-			}
-
-			fmt.Printf("client output:\n%s\n", reply)
-			fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
-
-		case shellMode:
-			if err := serverWriteFrame(writeMu, conn, line); err != nil {
-				logger.Error("send error", "remote_addr", remoteAddr, "event", "send_error", "error", err)
-				return
-			}
-
-			for {
-				msg, err := waitForServerResponse(sessionCtx, responses, errCh)
-				if err != nil {
-					logger.Error("receive error", "remote_addr", remoteAddr, "event", "receive_error", "error", err)
-					return
-				}
-
-				switch {
-				case strings.HasPrefix(msg, "shell_output:"):
-					fmt.Println(strings.TrimPrefix(msg, "shell_output:"))
-				case strings.HasPrefix(msg, "shell_done:"):
-					fmt.Printf("shell exit code: %s\n", strings.TrimPrefix(msg, "shell_done:"))
-					fmt.Printf("shell@%s> ", remoteAddr)
-					goto nextInput
-				case msg == "shell_closed":
-					mode = normalMode
-					fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
-					goto nextInput
-				default:
-					fmt.Printf("client output:\n%s\n", msg)
-				}
-			}
-		}
-
-	nextInput:
 	}
 
-	if err := scanner.Err(); err != nil {
-		logger.Error("stdin error", "remote_addr", remoteAddr, "event", "stdin_error", "error", err)
+	go serverReadLoop(sessionCtx, cancel, conn, remoteAddr, pongs, errCh)
+	go serverHeartbeatLoop(sessionCtx, cancel, conn, writeMu, pongs, errCh)
+	go serverInputLoop(scanner, sessionCtx, cancel, conn, writeMu, remoteAddr, mode, errCh)
+
+	if err := waitForSessionEnd(sessionCtx, errCh); err != nil {
+		logger.Error("session ended", "remote_addr", remoteAddr, "event", "session_ended", "error", err)
 	}
 }
 
@@ -263,7 +166,50 @@ func modePrompt(mode sessionMode) string {
 	if mode == shellMode {
 		return "shell"
 	}
+	if mode == execMode {
+		return "exec"
+	}
+	if mode == chatMode {
+		return "chat"
+	}
 	return "server"
+}
+
+func selectSessionMode(scanner *bufio.Scanner, target string) sessionMode {
+	fmt.Println("+------------------------------------------------+")
+	fmt.Println("|      __  __ _       _   _ _                    |")
+	fmt.Println("|     |  \\/  (_)_ __ | |_| (_)_ __   ___        |")
+	fmt.Println("|     | |\\/| | | '_ \\| __| | '_ \\ / _ \\      |")
+	fmt.Println("|     | |  | | | | | | |_| | | | | |  __/       |")
+	fmt.Println("|     |_|  |_|_|_| |_|\\__|_|_| |_|\\___|    |")
+	fmt.Println("+------------------------------------------------+")
+	fmt.Printf("choose mode for %s\n", target)
+	fmt.Println("  1) chat mode   - type free-form messages")
+	fmt.Println("  2) exec mode   - auto-run typed commands")
+	fmt.Println("  3) shell mode  - open a remote shell session")
+	fmt.Print("select [1/3]: ")
+
+	for scanner.Scan() {
+		choice := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		switch choice {
+		case "1", "chat", "c":
+			fmt.Println("chat mode selected")
+			return chatMode
+		case "2", "exec", "command", "e":
+			fmt.Println("exec mode selected")
+			return execMode
+		case "3", "shell", "s":
+			fmt.Println("shell mode selected")
+			return shellMode
+		default:
+			fmt.Print("select [1/3]: ")
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		logger.Error("mode selection failed", "remote_addr", target, "event", "mode_selection_failed", "error", err)
+	}
+	return chatMode
 }
 
 func showCommandHistory(remoteAddr string) {
@@ -312,7 +258,64 @@ func authenticateClient(conn net.Conn, expectedToken string) error {
 	return nil
 }
 
-func serverReadLoop(ctx context.Context, cancel context.CancelFunc, conn net.Conn, responses chan<- string, pongs chan<- struct{}, errCh chan<- error) {
+func serverInputLoop(scanner *bufio.Scanner, ctx context.Context, cancel context.CancelFunc, conn net.Conn, writeMu *sync.Mutex, remoteAddr string, mode sessionMode, errCh chan<- error) {
+	fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
+			continue
+		}
+
+		if line == "history" {
+			showCommandHistory(remoteAddr)
+			fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
+			continue
+		}
+
+		sendLine := line
+		if mode == execMode &&
+			!strings.HasPrefix(line, "command ") &&
+			!strings.HasPrefix(line, "info ") &&
+			line != "exit" &&
+			line != "history" {
+			sendLine = "command " + line
+		}
+
+		if line == "exit" {
+			logger.Info("closing session", "remote_addr", remoteAddr, "event", "session_closed")
+			cancel()
+			return
+		}
+
+		if err := serverWriteFrame(writeMu, conn, sendLine); err != nil {
+			select {
+			case errCh <- err:
+			default:
+			}
+			cancel()
+			return
+		}
+
+		fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
+	}
+
+	if err := scanner.Err(); err != nil {
+		select {
+		case errCh <- err:
+		default:
+		}
+		cancel()
+	}
+}
+
+func serverReadLoop(ctx context.Context, cancel context.CancelFunc, conn net.Conn, remoteAddr string, pongs chan<- struct{}, errCh chan<- error) {
 	for {
 		msg, err := protocol.ReadFrame(conn)
 		if err != nil {
@@ -331,11 +334,7 @@ func serverReadLoop(ctx context.Context, cancel context.CancelFunc, conn net.Con
 			default:
 			}
 		default:
-			select {
-			case responses <- msg:
-			case <-ctx.Done():
-				return
-			}
+			fmt.Printf("\nclient@%s: %s\nserver@%s> ", remoteAddr, msg, remoteAddr)
 		}
 	}
 }
@@ -382,22 +381,28 @@ func serverHeartbeatLoop(ctx context.Context, cancel context.CancelFunc, conn ne
 	}
 }
 
+func waitForSessionEnd(ctx context.Context, errCh <-chan error) error {
+	select {
+	case err := <-errCh:
+		if err == nil || errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		select {
+		case err := <-errCh:
+			if err == nil || errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		default:
+		}
+		return ctx.Err()
+	}
+}
+
 func serverWriteFrame(writeMu *sync.Mutex, conn net.Conn, payload string) error {
 	writeMu.Lock()
 	defer writeMu.Unlock()
 	return protocol.WriteFrame(conn, payload)
-}
-
-func waitForServerResponse(ctx context.Context, responses <-chan string, errCh <-chan error) (string, error) {
-	select {
-	case resp := <-responses:
-		return resp, nil
-	case err := <-errCh:
-		if err == nil {
-			return "", errors.New("session closed")
-		}
-		return "", err
-	case <-ctx.Done():
-		return "", ctx.Err()
-	}
 }
