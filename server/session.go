@@ -25,6 +25,13 @@ const (
 
 var logger = slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("component", "server")
 
+type sessionMode string
+
+const (
+	normalMode sessionMode = "normal"
+	shellMode  sessionMode = "shell"
+)
+
 type sessionManager struct {
 	mu     sync.Mutex
 	active net.Conn
@@ -139,8 +146,9 @@ func handleSession(parentCtx context.Context, conn net.Conn, token string) {
 	go serverReadLoop(sessionCtx, cancel, conn, responses, pongs, errCh)
 	go serverHeartbeatLoop(sessionCtx, cancel, conn, writeMu, pongs, errCh)
 
+	mode := normalMode
 	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Printf("server@%s> ", remoteAddr)
+	fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
 	for scanner.Scan() {
 		select {
 		case <-sessionCtx.Done():
@@ -150,32 +158,128 @@ func handleSession(parentCtx context.Context, conn net.Conn, token string) {
 
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
-			fmt.Printf("server@%s> ", remoteAddr)
+			fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
 			continue
 		}
 
-		if err := serverWriteFrame(writeMu, conn, line); err != nil {
-			logger.Error("send error", "remote_addr", remoteAddr, "event", "send_error", "error", err)
-			return
+		if err := appendCommandHistory(commandHistoryEntry{
+			Timestamp:  time.Now().UTC(),
+			Component:  "server",
+			RemoteAddr: remoteAddr,
+			Event:      "repl_command",
+			Mode:       string(mode),
+			Command:    line,
+		}); err != nil {
+			logger.Warn("history append failed", "remote_addr", remoteAddr, "event", "history_append_failed", "error", err)
 		}
 
-		if line == "exit" {
-			logger.Info("closing session", "remote_addr", remoteAddr, "event", "session_closed")
-			return
+		if line == "history" {
+			showCommandHistory(remoteAddr)
+			fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
+			continue
 		}
 
-		reply, err := waitForServerResponse(sessionCtx, responses, errCh)
-		if err != nil {
-			logger.Error("receive error", "remote_addr", remoteAddr, "event", "receive_error", "error", err)
-			return
+		switch mode {
+		case normalMode:
+			if line == "shell" {
+				if err := serverWriteFrame(writeMu, conn, line); err != nil {
+					logger.Error("send error", "remote_addr", remoteAddr, "event", "send_error", "error", err)
+					return
+				}
+
+				reply, err := waitForServerResponse(sessionCtx, responses, errCh)
+				if err != nil {
+					logger.Error("receive error", "remote_addr", remoteAddr, "event", "receive_error", "error", err)
+					return
+				}
+				if reply == "shell_ready" {
+					mode = shellMode
+					fmt.Printf("shell@%s> ", remoteAddr)
+					continue
+				}
+				fmt.Printf("client output:\n%s\n", reply)
+				fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
+				continue
+			}
+
+			if err := serverWriteFrame(writeMu, conn, line); err != nil {
+				logger.Error("send error", "remote_addr", remoteAddr, "event", "send_error", "error", err)
+				return
+			}
+
+			if line == "exit" {
+				logger.Info("closing session", "remote_addr", remoteAddr, "event", "session_closed")
+				return
+			}
+
+			reply, err := waitForServerResponse(sessionCtx, responses, errCh)
+			if err != nil {
+				logger.Error("receive error", "remote_addr", remoteAddr, "event", "receive_error", "error", err)
+				return
+			}
+
+			fmt.Printf("client output:\n%s\n", reply)
+			fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
+
+		case shellMode:
+			if err := serverWriteFrame(writeMu, conn, line); err != nil {
+				logger.Error("send error", "remote_addr", remoteAddr, "event", "send_error", "error", err)
+				return
+			}
+
+			for {
+				msg, err := waitForServerResponse(sessionCtx, responses, errCh)
+				if err != nil {
+					logger.Error("receive error", "remote_addr", remoteAddr, "event", "receive_error", "error", err)
+					return
+				}
+
+				switch {
+				case strings.HasPrefix(msg, "shell_output:"):
+					fmt.Println(strings.TrimPrefix(msg, "shell_output:"))
+				case strings.HasPrefix(msg, "shell_done:"):
+					fmt.Printf("shell exit code: %s\n", strings.TrimPrefix(msg, "shell_done:"))
+					fmt.Printf("shell@%s> ", remoteAddr)
+					goto nextInput
+				case msg == "shell_closed":
+					mode = normalMode
+					fmt.Printf("%s@%s> ", modePrompt(mode), remoteAddr)
+					goto nextInput
+				default:
+					fmt.Printf("client output:\n%s\n", msg)
+				}
+			}
 		}
 
-		fmt.Printf("client output:\n%s\n", reply)
-		fmt.Printf("server@%s> ", remoteAddr)
+	nextInput:
 	}
 
 	if err := scanner.Err(); err != nil {
 		logger.Error("stdin error", "remote_addr", remoteAddr, "event", "stdin_error", "error", err)
+	}
+}
+
+func modePrompt(mode sessionMode) string {
+	if mode == shellMode {
+		return "shell"
+	}
+	return "server"
+}
+
+func showCommandHistory(remoteAddr string) {
+	history, err := tailCommandHistory(20)
+	if err != nil {
+		logger.Error("history read error", "remote_addr", remoteAddr, "event", "history_read_error", "error", err)
+		return
+	}
+
+	if len(history) == 0 {
+		fmt.Println("no command history")
+		return
+	}
+
+	for _, line := range history {
+		fmt.Println(line)
 	}
 }
 

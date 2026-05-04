@@ -84,10 +84,11 @@ func runClientSession(serverAddr, token string, certPEM []byte, allowed map[stri
 
 	writeMu := &sync.Mutex{}
 	sessionErr := make(chan error, 1)
+	shellMgr := newShellManager()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go clientReadLoop(ctx, cancel, conn, writeMu, allowed, sessionErr)
+	go clientReadLoop(ctx, cancel, conn, writeMu, allowed, shellMgr, sessionErr)
 
 	if err := waitForSessionEnd(ctx, sessionErr); err != nil {
 		return err
@@ -143,7 +144,7 @@ func authenticate(conn net.Conn, token string) error {
 	}
 }
 
-func clientReadLoop(ctx context.Context, cancel context.CancelFunc, conn net.Conn, writeMu *sync.Mutex, allowed map[string]struct{}, sessionErr chan<- error) {
+func clientReadLoop(ctx context.Context, cancel context.CancelFunc, conn net.Conn, writeMu *sync.Mutex, allowed map[string]struct{}, shellMgr *shellManager, sessionErr chan<- error) {
 	for {
 		msg, err := protocol.ReadFrame(conn)
 		if err != nil {
@@ -155,11 +156,52 @@ func clientReadLoop(ctx context.Context, cancel context.CancelFunc, conn net.Con
 			return
 		}
 
+		trimmed := strings.TrimSpace(msg)
 		logger.Info("received command", "remote_addr", conn.RemoteAddr().String(), "event", "command_received", "command", msg)
 
-		switch strings.TrimSpace(msg) {
+		switch trimmed {
 		case heartbeatPing:
 			if err := clientWriteFrame(writeMu, conn, heartbeatPong); err != nil {
+				select {
+				case sessionErr <- err:
+				default:
+				}
+				cancel()
+				return
+			}
+		case "shell":
+			if err := shellMgr.Start(); err != nil {
+				if writeErr := clientWriteFrame(writeMu, conn, "shell_error:"+err.Error()); writeErr != nil {
+					select {
+					case sessionErr <- writeErr:
+					default:
+					}
+					cancel()
+					return
+				}
+				continue
+			}
+			if err := clientWriteFrame(writeMu, conn, "shell_ready"); err != nil {
+				select {
+				case sessionErr <- err:
+				default:
+				}
+				cancel()
+				return
+			}
+		case "shell exit":
+			if err := shellMgr.Stop(); err != nil {
+				if writeErr := clientWriteFrame(writeMu, conn, "shell_error:"+err.Error()); writeErr != nil {
+					select {
+					case sessionErr <- writeErr:
+					default:
+					}
+					cancel()
+					return
+				}
+				continue
+			}
+			if err := clientWriteFrame(writeMu, conn, "shell_closed"); err != nil {
 				select {
 				case sessionErr <- err:
 				default:
@@ -176,6 +218,42 @@ func clientReadLoop(ctx context.Context, cancel context.CancelFunc, conn net.Con
 			}
 			return
 		default:
+			if shellMgr.Active() {
+				go func(command string) {
+					outputs, exitCode, runErr := shellMgr.Run(command)
+					if runErr != nil {
+						if writeErr := clientWriteFrame(writeMu, conn, "shell_error:"+runErr.Error()); writeErr != nil {
+							select {
+							case sessionErr <- writeErr:
+							default:
+							}
+							cancel()
+						}
+						return
+					}
+
+					for _, outputLine := range outputs {
+						if writeErr := clientWriteFrame(writeMu, conn, "shell_output:"+outputLine); writeErr != nil {
+							select {
+							case sessionErr <- writeErr:
+							default:
+							}
+							cancel()
+							return
+						}
+					}
+
+					if writeErr := clientWriteFrame(writeMu, conn, fmt.Sprintf("shell_done:%d", exitCode)); writeErr != nil {
+						select {
+						case sessionErr <- writeErr:
+						default:
+						}
+						cancel()
+					}
+				}(trimmed)
+				continue
+			}
+
 			go func(command string) {
 				response := execute(command, allowed)
 				if err := clientWriteFrame(writeMu, conn, response); err != nil {
@@ -193,14 +271,20 @@ func clientReadLoop(ctx context.Context, cancel context.CancelFunc, conn net.Con
 func waitForSessionEnd(ctx context.Context, sessionErr <-chan error) error {
 	select {
 	case err := <-sessionErr:
+		if err == nil || errors.Is(err, context.Canceled) {
+			return nil
+		}
 		return err
 	case <-ctx.Done():
 		select {
 		case err := <-sessionErr:
+			if err == nil || errors.Is(err, context.Canceled) {
+				return nil
+			}
 			return err
 		default:
-			return ctx.Err()
 		}
+		return ctx.Err()
 	}
 }
 
@@ -217,14 +301,7 @@ func execute(raw string, allowed map[string]struct{}) string {
 	}
 
 	if fields[0] == "info" {
-		if len(fields) == 2 && fields[1] == "cwd" {
-			cwd, err := os.Getwd()
-			if err != nil {
-				return fmt.Sprintf("cwd error: %v", err)
-			}
-			return cwd
-		}
-		return "unknown info instruction"
+		return handleInfo(fields)
 	}
 
 	if fields[0] != "command" {

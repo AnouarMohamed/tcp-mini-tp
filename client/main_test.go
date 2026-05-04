@@ -261,7 +261,7 @@ func TestClientReadLoopHandlesReadError(t *testing.T) {
 	defer cancel()
 
 	sessionErr := make(chan error, 1)
-	go clientReadLoop(ctx, cancel, client, &sync.Mutex{}, map[string]struct{}{}, sessionErr)
+	go clientReadLoop(ctx, cancel, client, &sync.Mutex{}, map[string]struct{}{}, newShellManager(), sessionErr)
 
 	server.Close()
 	if err := <-sessionErr; err == nil {
