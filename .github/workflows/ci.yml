@@ -2,6 +2,58 @@ name: CI
 
 on:
   push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.22'
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ${{ github.workspace }}/go.sum
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Ensure gofmt is clean
+        run: |
+          set -euo pipefail
+          echo "Checking gofmt..."
+          files=$(git ls-files '*.go' | xargs -r gofmt -l)
+          if [ -n "$files" ]; then
+            echo "gofmt reported unformatted files:" >&2
+            echo "$files" >&2
+            exit 1
+          fi
+
+      - name: Run tests
+        run: |
+          set -euo pipefail
+          go test ./...
+
+      - name: Run vet
+        run: |
+          set -euo pipefail
+          go vet ./...
+name: CI
+
+on:
+  push:
     branches: [main]
   pull_request:
     branches: [main]
