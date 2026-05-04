@@ -32,6 +32,16 @@ Client listener  <--- heartbeat ping/pong --->  Server heartbeat loop
 | Command history | Every REPL command is appended to `commands.log` as newline-delimited JSON; `history` prints the last 20 entries. |
 | Output cap | Command output is limited to 64 KB. |
 
+## Screenshots
+
+The demo scenes below show the main flows this mini TP supports.
+
+| TLS handshake & auth | Command execution & allowlist |
+| --- | --- |
+| ![TLS handshake and authentication](docs/screenshots/01-tls-auth.png) | ![Command execution and allowlist enforcement](docs/screenshots/02-commands.png) |
+| Info commands & reconnect | History & graceful shutdown |
+| ![Info instructions and reconnect backoff](docs/screenshots/03-info-reconnect.png) | ![Command history and graceful shutdown](docs/screenshots/04-history-shutdown.png) |
+
 ## Protocol
 
 Each message is sent as a 4-byte big-endian length header followed by the UTF-8 payload. That framing avoids partial-read issues on raw TCP streams and keeps request/response handling simple.
