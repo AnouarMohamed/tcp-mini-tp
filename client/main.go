@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,16 +18,36 @@ import (
 	"tcp-mini-tp/internal/protocol"
 )
 
+const maxOutputSize = 64 * 1024 // 64 KB cap on command output
+
 var defaultAllowedCommands = []string{"pwd", "ls", "whoami", "uname", "date", "echo", "cat", "id", "cd"}
 
-func connectAndServe(serverAddr, token string, allowed map[string]struct{}) error {
-	conn, err := net.Dial("tcp", serverAddr)
+func connectAndServe(serverAddr, token string, certPEM []byte, allowed map[string]struct{}) error {
+	// Create TLS config
+	var tlsConfig *tls.Config
+
+	if len(certPEM) > 0 {
+		certPool := x509.NewCertPool()
+		if !certPool.AppendCertsFromPEM(certPEM) {
+			return errors.New("failed to parse certificate")
+		}
+		tlsConfig = &tls.Config{
+			RootCAs: certPool,
+		}
+	} else {
+		// InsecureSkipVerify for self-signed certs without explicit cert file
+		tlsConfig = &tls.Config{
+			InsecureSkipVerify: true,
+		}
+	}
+
+	conn, err := tls.Dial("tcp", serverAddr, tlsConfig)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	log.Printf("connected to server %s", serverAddr)
+	log.Printf("connected to server %s (TLS)", serverAddr)
 	if err := authenticate(conn, token); err != nil {
 		return err
 	}
@@ -110,22 +133,33 @@ func execute(raw string, allowed map[string]struct{}) string {
 		return fmt.Sprintf("changed directory to %s", path)
 	}
 
-	base := filepath.Base(fields[1])
+	// Resolve command using exec.LookPath (prevents path traversal bypass)
+	resolvedPath, err := exec.LookPath(fields[1])
+	if err != nil {
+		return fmt.Sprintf("command not found: %s", fields[1])
+	}
+
+	// Check against whitelist using basename of resolved path
+	base := filepath.Base(resolvedPath)
 	if _, ok := allowed[base]; !ok {
 		return fmt.Sprintf("blocked command: %s (not in whitelist)", base)
 	}
 
-	cmd := exec.Command(fields[1], fields[2:]...)
+	cmd := exec.Command(resolvedPath, fields[2:]...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Sprintf("command error: %v\n%s", err, string(output))
 	}
 
-	if len(output) == 0 {
+	// Cap output at 64KB using io.LimitedReader
+	limitedOutput := io.LimitedReader{R: bytes.NewReader(output), N: maxOutputSize}
+	cappedOutput, _ := io.ReadAll(&limitedOutput)
+
+	if len(cappedOutput) == 0 {
 		return "(no output)"
 	}
 
-	return string(output)
+	return string(cappedOutput)
 }
 
 func parseAllowlist(raw string) map[string]struct{} {
@@ -153,12 +187,22 @@ func parseAllowlist(raw string) map[string]struct{} {
 func main() {
 	serverAddr := flag.String("server", "localhost:9898", "TCP server address")
 	token := flag.String("token", "tp-secret", "shared authentication token")
+	certFile := flag.String("cert", "", "path to TLS certificate file (optional, uses InsecureSkipVerify if not provided)")
 	allowlist := flag.String("allow", "pwd,ls,whoami,uname,date,echo,cat,id,cd", "comma-separated whitelist for allowed commands")
 	flag.Parse()
 
 	allowed := parseAllowlist(*allowlist)
 
-	if err := connectAndServe(*serverAddr, *token, allowed); err != nil {
+	var certPEM []byte
+	if *certFile != "" {
+		var err error
+		certPEM, err = os.ReadFile(*certFile)
+		if err != nil {
+			log.Fatalf("failed to read certificate file: %v", err)
+		}
+	}
+
+	if err := connectAndServe(*serverAddr, *token, certPEM, allowed); err != nil {
 		log.Fatal(err)
 	}
 }

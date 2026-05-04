@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/subtle"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,14 +17,26 @@ import (
 	"tcp-mini-tp/internal/protocol"
 )
 
-func startServer(listenAddr, token string) error {
-	listener, err := net.Listen("tcp", listenAddr)
+func startServer(listenAddr, token, certFile, keyFile string) error {
+	// Generate self-signed certificate if missing
+	if err := GenerateSelfSignedCert(certFile, keyFile); err != nil {
+		return fmt.Errorf("cert generation failed: %w", err)
+	}
+
+	// Load TLS certificate
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return fmt.Errorf("failed to load TLS cert: %w", err)
+	}
+
+	config := &tls.Config{Certificates: []tls.Certificate{cert}}
+	listener, err := tls.Listen("tcp", listenAddr, config)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
 
-	log.Printf("server listening on %s", listenAddr)
+	log.Printf("server listening on %s (TLS)", listenAddr)
 
 	for {
 		conn, err := listener.Accept()
@@ -107,7 +121,8 @@ func authenticateClient(conn net.Conn, expectedToken string) error {
 		return fmt.Errorf("invalid auth message")
 	}
 
-	if parts[1] != expectedToken {
+	// Constant-time comparison to prevent timing attacks
+	if subtle.ConstantTimeCompare([]byte(parts[1]), []byte(expectedToken)) != 1 {
 		return errors.New("invalid token")
 	}
 
@@ -117,9 +132,11 @@ func authenticateClient(conn net.Conn, expectedToken string) error {
 func main() {
 	listenAddr := flag.String("listen", ":9898", "TCP address to listen on")
 	token := flag.String("token", "tp-secret", "shared authentication token")
+	certFile := flag.String("cert", "cert.pem", "path to TLS certificate file")
+	keyFile := flag.String("key", "key.pem", "path to TLS private key file")
 	flag.Parse()
 
-	if err := startServer(*listenAddr, *token); err != nil {
+	if err := startServer(*listenAddr, *token, *certFile, *keyFile); err != nil {
 		log.Fatal(err)
 	}
 }

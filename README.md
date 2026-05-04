@@ -6,10 +6,38 @@ This repository is a mini practical work (TP) to understand:
 - basic remote command execution flow
 - clean code organization in Go
 
+TP2 hardening has been added:
+- shared-token authentication at connection start
+- command whitelist on the client side
+
+## Security Improvements (TP2 & TP3)
+
+**TP2:**
+- Shared-token authentication
+- Command whitelist enforcement
+
+**TP3 (Latest):**
+1. **TLS Encryption** - All traffic encrypted, self-signed certificate auto-generated on first run
+   - Server: `cert.pem` and `key.pem` generated automatically
+   - Client: Accepts optional `-cert` flag for certificate verification
+   
+2. **Timing Attack Prevention** - Token comparison using `crypto/subtle.ConstantTimeCompare`
+   - Prevents timing-based token disclosure
+   
+3. **Path Traversal Prevention** - `exec.LookPath` validates command before whitelist check
+   - Blocks commands like `../../bin/dangerous`
+   - Only resolved binary path is checked against whitelist
+   
+4. **Output Size Capping** - Command output limited to 64KB
+   - Prevents memory exhaustion from large command outputs
+   - Uses `io.LimitedReader`
+
 ## Project Structure
 
 - `server/main.go`: server executable (listens, sends commands, prints client output)
+- `server/tls.go`: TLS certificate generation utility
 - `client/main.go`: client executable (receives commands, executes, sends output)
+- `client/main_test.go`: client-side tests
 - `internal/protocol/protocol.go`: shared framing logic
 - `internal/protocol/protocol_test.go`: protocol tests
 
@@ -20,6 +48,7 @@ Each message is sent as:
 2. payload bytes (UTF-8 string)
 
 This avoids partial-read issues and allows clean request/response exchanges.
+All traffic is encrypted with TLS.
 
 ## Prerequisites
 
@@ -38,18 +67,34 @@ go build -o bin/client ./client
 Terminal 1 (server):
 
 ```bash
-go run ./server -listen :9898
+go run ./server -listen :9898 -token tp-secret
 ```
+
+The first run will auto-generate `cert.pem` and `key.pem`.
 
 Terminal 2 (client):
 
 ```bash
-go run ./client -server localhost:9898
+go run ./client -server localhost:9898 -token tp-secret
+```
+
+Optional: Use explicit certificate (for production verification):
+
+```bash
+go run ./client -server localhost:9898 -token tp-secret -cert cert.pem
+```
+
+Optional: customize allowed commands on the client:
+
+```bash
+go run ./client -server localhost:9898 -token tp-secret -allow "pwd,ls,whoami,cd"
 ```
 
 ## Usage
 
 Type commands in the server terminal.
+
+The reverse command channel is still present: the server sends commands, the client executes them, and returns output.
 
 - To execute a shell command on the client:
 
@@ -64,6 +109,12 @@ command whoami
 ```text
 command cd /tmp
 command pwd
+```
+
+- Non-shell info request:
+
+```text
+info cwd
 ```
 
 - To close session:
@@ -86,13 +137,21 @@ exit
 - Send `command cd /path/that/does/not/exist`
 - Explain where the error is produced and how it is returned.
 
-4. Extension task:
-- Add support for a new instruction prefix `info` on client side.
-- Example expected behavior: `info cwd` returns current directory without calling shell.
+4. TP2 security validation:
+- Start client/server with same token and validate normal behavior.
+- Restart client with wrong token and observe authentication failure.
+- Send a blocked command (not in whitelist), then validate the rejection message.
 
-5. Security discussion:
+5. TP3 security validation:
+- Verify TLS handshake by checking certificate files are created
+- Test timing attack resistance by attempting token bypass
+- Try path traversal: `command ../../bin/touch` should be blocked
+- Verify large outputs are capped at 64KB
+
+6. Security discussion:
 - Explain risks of executing arbitrary shell commands.
 - Propose two mitigations for production use.
+- Discuss certificate pinning vs. InsecureSkipVerify tradeoffs
 
 ## CI/CD
 
@@ -106,3 +165,10 @@ GitHub Actions runs on every push and PR to `main`:
 ## Notes
 
 This project is intentionally educational and minimal. Do not expose it on untrusted networks.
+
+For production use, consider:
+- Implementing proper certificate management
+- Using mTLS for mutual authentication
+- Adding audit logging
+- Implementing rate limiting
+- Using sandboxing/containers for command execution
